@@ -6,21 +6,21 @@ import profiles from "../modals/profile.js";
 
 const router = express.Router();
 
-const app = express();
+// Rate limit for login/register
+router.use(
+  rateLimit({
+    windowMs: 20 * 60 * 1000,
+    max: 5,
+    message: "Too many requests, try again later",
+  })
+);
 
-const loginLimiter = app.use(
-    rateLimit({
-        windowMs:20*60*1000,//15mins
-        max:5,
-        message:"Too many requests,try again later",
-    })
-)
-
+// Verify JWT token middleware
 function verifyToken(req, res, next) {
   const authHeader = req.headers.authorization;
 
   if (!authHeader) {
-    return res.status(401).json({ message: "no token provided" });
+    return res.status(401).json({ message: "No token provided" });
   }
 
   const tokenSignature = authHeader.split(" ")[1];
@@ -28,9 +28,9 @@ function verifyToken(req, res, next) {
   jwt.verify(tokenSignature, process.env.JWT_SECRET, (err, decoded) => {
     if (err) {
       if (err.name === "TokenExpiredError") {
-        return res.status(401).json({ message: "access token expired" });
+        return res.status(401).json({ message: "Access token expired" });
       } else {
-        return res.status(403).json({ message: "invalid token" });
+        return res.status(403).json({ message: "Invalid token" });
       }
     }
 
@@ -39,19 +39,20 @@ function verifyToken(req, res, next) {
   });
 }
 
+// REGISTER
 router.post("/api/register", async (req, res) => {
   try {
     const { name, email, role, adminCode, imageUrl, password } = req.body;
     if (!name || !email || !role || !imageUrl || !password) {
-      return res.status(400).json({ message: "all fields are required" });
+      return res.status(400).json({ message: "All fields are required" });
     }
 
     let userRole = role;
     if (role === "admin" && adminCode !== process.env.ADMIN_CODE) {
-      return res
-        .status(403)
-        .json({ message: `invalid admin code -${adminCode}` });
-    } else if (role !== "admin") userRole = "user";
+      return res.status(403).json({ message: `Invalid admin code` });
+    } else if (role !== "admin") {
+      userRole = "user";
+    }
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
@@ -62,33 +63,32 @@ router.post("/api/register", async (req, res) => {
       role: userRole,
       imageUrl,
     });
-    res.status(200).json({ message: `object created with role - ${userRole}` });
+
+    res.status(200).json({ message: `User created with role: ${userRole}` });
   } catch (error) {
-    res.status(500).json({ message: `something went wrong ${error}` });
+    res.status(500).json({ message: `Something went wrong ${error}` });
   }
 });
 
+// LOGIN
 router.post("/api/login", async (req, res) => {
-  console.log("trigg");
   try {
     const { email, password } = req.body;
 
     const profile = await profiles.findOne({ email });
     if (!profile) {
-      return res
-        .status(404)
-        .json({ message: `object with ${email} not found` });
+      return res.status(404).json({ message: `User with ${email} not found` });
     }
 
     const isMatch = await bcrypt.compare(password, profile.password);
     if (!isMatch) {
-      return res.status(401).json({ message: "invalid password" });
+      return res.status(401).json({ message: "Invalid password" });
     }
 
     const accessToken = jwt.sign(
       { id: profile._id, role: profile.role },
       process.env.JWT_SECRET,
-      { expiresIn: "1min" }
+      { expiresIn: "10m" }
     );
 
     const refreshToken = jwt.sign(
@@ -99,98 +99,117 @@ router.post("/api/login", async (req, res) => {
 
     profile.refreshToken = refreshToken;
     await profile.save();
-    res.status(200).json({ id: profile._id,accessToken, refreshToken, role: profile.role });
+
+    res.status(200).json({
+      id: profile._id,
+      accessToken,
+      refreshToken,
+      role: profile.role,
+    });
   } catch (error) {
-    res.status(500).json({ message: `something went wrong ${error}` });
+    res.status(500).json({ message: `Something went wrong ${error}` });
   }
 });
 
-router.get("/", verifyToken, async (req, res) => {
+// GET USERS / GET SELF
+router.get("/api/users", verifyToken, async (req, res) => {
   try {
     if (req.profile.role === "admin") {
-      const profileData = await profiles.find({}, "-password -refreshToken");
-      res.status(200).json(profileData);
-    } else {
-      const profile = await profiles.findById(req.profile.id);
-      res.status(200).json(profile);
+      const users = await profiles.find({}, "-password -refreshToken");
+      return res.status(200).json(users);
     }
+
+    const user = await profiles.findById(req.profile.id, "-password -refreshToken");
+    res.status(200).json(user);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-router.put("/:id",verifyToken,async (req,res) =>{
-    if(req.profile.role === "admin"){
-        return res.status(403).json({
-            message:`access denied because your are a ${req.profile.role}`,
-        })
+// UPDATE USER
+router.put("/api/users/:id", verifyToken, async (req, res) => {
+  try {
+    const { name, role, imageUrl } = req.body;
+
+    // Admin can update anyone; user can update only themselves
+    if (req.profile.role !== "admin" && req.profile.id !== req.params.id) {
+      return res.status(403).json({ message: "Access denied" });
     }
 
-    let {name,role,imageUrl}= req.body;
+    const updateData = { name, imageUrl };
 
-    let userRole ="user";
-    if(role !== admin){
-        role = userRole;
+    // Only admin can update roles
+    if (req.profile.role === "admin" && role) {
+      updateData.role = role;
     }
-    await profiles.findByIdAndUpdate(
-        req.params.id,
-        {name,role,imageUrl},
-        {new:true}
+
+    const updatedUser = await profiles.findByIdAndUpdate(
+      req.params.id,
+      updateData,
+      { new: true }
     );
-    res.status(200).json({message:`object with id: ${req.params.id} is edited.`})
+
+    if (!updatedUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.status(200).json({
+      message: "User updated successfully",
+      user: updatedUser,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
 });
 
-router.delete("/:id",verifyToken,async (req,res) =>{
-    console.log(req.params.id);
-    if(req.profile.role !== "admin"){
-        return res.status(403).json({
-            message:`access denied because you are a ${req.profile.role}`,
-        })
+// DELETE USER
+router.delete("/api/users/:id", verifyToken, async (req, res) => {
+  try {
+    // Only admin can delete
+    if (req.profile.role !== "admin") {
+      return res.status(403).json({
+        message: `Access denied because you are a ${req.profile.role}`,
+      });
     }
 
-    await profiles.findByIdAndDelete(req.params.id);
-    res.status(200).json({message:`object with id ${req.params.id} has been deleted`});
+    const deleted = await profiles.findByIdAndDelete(req.params.id);
+
+    if (!deleted) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res
+      .status(200)
+      .json({ message: `User with id ${req.params.id} has been deleted` });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
 });
 
-router.post("/refresh",async(req,res)=>{
-    const {token} = req.body;
+// REFRESH TOKEN
+router.post("/api/refresh", async (req, res) => {
+  const { token } = req.body;
 
-    if(!token){
-        return res.status(401).json({message:"no refresh token"});
+  if (!token) return res.status(401).json({ message: "No refresh token" });
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_REFRESH_SECRET);
+
+    const profile = await profiles.findById(decoded.id);
+    if (!profile || profile.refreshToken !== token) {
+      return res.status(403).json({ message: "Invalid refresh token" });
     }
 
-    try{
-        const decoded = jwt.verify(token,process.env.JWT_REFRESH_SECRET);
-        console.log(decoded);
+    const newAccessToken = jwt.sign(
+      { id: profile._id, role: profile.role },
+      process.env.JWT_SECRET,
+      { expiresIn: "1m" }
+    );
 
-        const profile = await profiles.findById(decoded.id);
-        if(!profile){
-            return res.status(403).json({message:"invalid refresh token"});
-        }
-        const newAccessToken = jwt.sign(
-            {
-                id:profile._id,
-                role:profile.role,
-            },
-            
-                process.env.JWT_SECRET,
-                {expiresIn:"1min"}
-        );
-        res.status(200).json({accessToken:newAccessToken});
-    }catch(error){
-        res.status(500).json({message:error.message});
-    }
-})
-
-
+    res.status(200).json({ accessToken: newAccessToken });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
 
 export default router;
-
-// npm install jsonwebtoken bcryptjs
-
-//     {
-//   id: "6740e7e2b8f7c5b9c3a9e412",   // the user's MongoDB _id
-//   role: "admin",                   // or "user"
-//   iat: 1730430245,                 // "issued at" timestamp (auto added by JWT)
-//   exp: 1730430845                  // "expires at" timestamp (auto added by JWT)
-// }
